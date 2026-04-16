@@ -29,6 +29,7 @@ test("QoderExecutor: buildHeaders inherits configured user agent, auth and strea
     "Content-Type": "application/json",
     "User-Agent": "Qoder-Cli",
     Authorization: "Bearer token",
+    Accept: "application/json",
   });
 });
 
@@ -115,7 +116,10 @@ test("validateQoderCliPat succeeds when the validation endpoint returns OK", asy
     if (urlStr.includes("/ping")) {
       return new Response("pong", { status: 200 });
     }
-    assert.match(urlStr, /api1\.qoder\.sh\/algo\/api\/v2\/service\/pro\/sse\/agent_chat_generation/);
+    assert.match(
+      urlStr,
+      /api1\.qoder\.sh\/algo\/api\/v2\/service\/pro\/sse\/agent_chat_generation/
+    );
     assert.equal(options.method, "POST");
     assert.match(String(options.headers.Authorization), /^Bearer COSY\./);
     return new Response("{}", { status: 200 });
@@ -231,4 +235,28 @@ test("QoderExecutor: stream calls pass through successful SSE responses", async 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("QoderExecutor: neutralizes incompatible tool_choice when Qwen thinking is active", () => {
+  const executor = new QoderExecutor();
+  const result = executor.transformRequest("qwen3-coder-plus", {
+    messages: [{ role: "user", content: "hi" }],
+    thinking: true,
+    tool_choice: "required",
+  });
+
+  assert.equal(result.model, "qwen3-coder-plus");
+  assert.equal(result.tool_choice, "auto");
+});
+
+test("QoderExecutor: preserves tool_choice when thinking is inactive", () => {
+  const executor = new QoderExecutor();
+  const forcedTool = { type: "function", function: { name: "pwd" } };
+  const result = executor.transformRequest("qwen3-coder-plus", {
+    messages: [{ role: "user", content: "hi" }],
+    tool_choice: forcedTool,
+  });
+
+  assert.equal(result.model, "qwen3-coder-plus");
+  assert.deepEqual(result.tool_choice, forcedTool);
 });

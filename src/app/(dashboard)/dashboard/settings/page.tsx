@@ -12,15 +12,15 @@ import ComboDefaultsTab from "./components/ComboDefaultsTab";
 import ProxyTab from "./components/ProxyTab";
 import AppearanceTab from "./components/AppearanceTab";
 import ThinkingBudgetTab from "./components/ThinkingBudgetTab";
-import CodexServiceTierTab from "./components/CodexServiceTierTab";
 import SystemPromptTab from "./components/SystemPromptTab";
-import ModelAliasesTab from "./components/ModelAliasesTab";
+import ModelAliasesUnified from "./components/ModelAliasesUnified";
 import BackgroundDegradationTab from "./components/BackgroundDegradationTab";
 import CacheSettingsTab from "./components/CacheSettingsTab";
 import MemorySkillsTab from "./components/MemorySkillsTab";
 import ModelsDevSyncTab from "./components/ModelsDevSyncTab";
 import ResilienceTab from "./components/ResilienceTab";
 import CliproxyapiSettingsTab from "./components/CliproxyapiSettingsTab";
+import ModelRoutingSection from "@/shared/components/ModelRoutingSection";
 
 const tabs = [
   { id: "general", labelKey: "general", icon: "settings" },
@@ -92,7 +92,6 @@ export default function SettingsPage() {
           {activeTab === "ai" && (
             <div className="flex flex-col gap-6">
               <ThinkingBudgetTab />
-              <CodexServiceTierTab />
               <SystemPromptTab />
               <CacheSettingsTab />
               <MemorySkillsTab />
@@ -105,8 +104,9 @@ export default function SettingsPage() {
           {activeTab === "routing" && (
             <div className="flex flex-col gap-6">
               <RoutingTab />
+              <ModelRoutingSection />
               <ComboDefaultsTab />
-              <ModelAliasesTab />
+              <ModelAliasesUnified />
               <BackgroundDegradationTab />
             </div>
           )}

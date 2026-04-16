@@ -9,6 +9,7 @@ import path from "path";
 import fs from "fs";
 import { resolveDataDir, getLegacyDotDataDir } from "../dataPaths";
 import { runMigrations } from "./migrationRunner";
+import { runDbHealthCheck } from "./healthCheck";
 
 type SqliteDatabase = import("better-sqlite3").Database;
 type JsonRecord = Record<string, unknown>;
@@ -162,17 +163,24 @@ const SCHEMA_SQL = `
     path TEXT,
     status INTEGER,
     model TEXT,
+    requested_model TEXT,
     provider TEXT,
     account TEXT,
     connection_id TEXT,
     duration INTEGER DEFAULT 0,
     tokens_in INTEGER DEFAULT 0,
     tokens_out INTEGER DEFAULT 0,
+    tokens_cache_read INTEGER DEFAULT NULL,
+    tokens_cache_creation INTEGER DEFAULT NULL,
+    tokens_reasoning INTEGER DEFAULT NULL,
+    request_type TEXT,
     source_format TEXT,
     target_format TEXT,
     api_key_id TEXT,
     api_key_name TEXT,
     combo_name TEXT,
+    combo_step_id TEXT,
+    combo_execution_key TEXT,
     request_body TEXT,
     response_body TEXT,
     error TEXT,
@@ -401,6 +409,42 @@ function ensureCallLogsColumns(db: SqliteDatabase) {
       db.exec("ALTER TABLE call_logs ADD COLUMN has_pipeline_details INTEGER DEFAULT 0");
       console.log("[DB] Added call_logs.has_pipeline_details column");
     }
+    if (!columnNames.has("requested_model")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN requested_model TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.requested_model column");
+    }
+    if (!columnNames.has("request_type")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN request_type TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.request_type column");
+    }
+    if (!columnNames.has("tokens_cache_read")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN tokens_cache_read INTEGER DEFAULT NULL");
+      console.log("[DB] Added call_logs.tokens_cache_read column");
+    }
+    if (!columnNames.has("tokens_cache_creation")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN tokens_cache_creation INTEGER DEFAULT NULL");
+      console.log("[DB] Added call_logs.tokens_cache_creation column");
+    }
+    if (!columnNames.has("tokens_reasoning")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN tokens_reasoning INTEGER DEFAULT NULL");
+      console.log("[DB] Added call_logs.tokens_reasoning column");
+    }
+    if (!columnNames.has("combo_step_id")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN combo_step_id TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.combo_step_id column");
+    }
+    if (!columnNames.has("combo_execution_key")) {
+      db.exec("ALTER TABLE call_logs ADD COLUMN combo_execution_key TEXT DEFAULT NULL");
+      console.log("[DB] Added call_logs.combo_execution_key column");
+    }
+
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_call_logs_requested_model ON call_logs(requested_model)"
+    );
+    db.exec("CREATE INDEX IF NOT EXISTS idx_call_logs_request_type ON call_logs(request_type)");
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_cl_combo_target ON call_logs(combo_name, combo_execution_key, timestamp)"
+    );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn("[DB] Failed to verify call_logs schema:", message);
@@ -410,6 +454,96 @@ function ensureCallLogsColumns(db: SqliteDatabase) {
 function hasColumn(db: SqliteDatabase, tableName: string, columnName: string): boolean {
   const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name?: string }>;
   return rows.some((row) => row.name === columnName);
+}
+
+function isAutomatedTestProcess(): boolean {
+  return (
+    typeof process !== "undefined" &&
+    (process.env.NODE_ENV === "test" ||
+      process.env.VITEST !== undefined ||
+      process.argv.some((arg) => arg.includes("test")))
+  );
+}
+
+function shouldRunStartupDbHealthCheck(): boolean {
+  if (process.env.OMNIROUTE_FORCE_DB_HEALTHCHECK === "1") return true;
+  return !isAutomatedTestProcess();
+}
+
+function createHealthCheckBackup(db: SqliteDatabase): boolean {
+  const isTest = isAutomatedTestProcess();
+  if (isTest) return false;
+
+  try {
+    const backupDir = DB_BACKUPS_DIR || path.join(DATA_DIR, "db_backups");
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = path.join(backupDir, `db_${timestamp}_health-check-repair.sqlite`);
+    const escapedBackupPath = backupPath.replace(/'/g, "''");
+
+    db.exec(`VACUUM INTO '${escapedBackupPath}'`);
+    console.log(`[DB] Health-check backup created: ${backupPath}`);
+    return true;
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn("[DB] Failed to create health-check backup:", message);
+    return false;
+  }
+}
+
+let dbHealthCheckTimer: NodeJS.Timeout | null = null;
+
+function getDbHealthCheckIntervalMs(): number {
+  const rawValue = process.env.OMNIROUTE_DB_HEALTHCHECK_INTERVAL_MS;
+  if (typeof rawValue === "string" && rawValue.trim().length > 0) {
+    const parsed = Number(rawValue);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  return 6 * 60 * 60 * 1000;
+}
+
+function clearDbHealthCheckScheduler() {
+  if (dbHealthCheckTimer) {
+    clearInterval(dbHealthCheckTimer);
+    dbHealthCheckTimer = null;
+  }
+}
+
+function startDbHealthCheckScheduler(db: SqliteDatabase) {
+  clearDbHealthCheckScheduler();
+  if (isCloud || isBuildPhase || isAutomatedTestProcess()) return;
+
+  const intervalMs = getDbHealthCheckIntervalMs();
+  if (intervalMs <= 0) return;
+
+  dbHealthCheckTimer = setInterval(() => {
+    try {
+      if (!db.open) return;
+      runDbHealthCheck(db, {
+        autoRepair: true,
+        expectedSchemaVersion: "1",
+        createBackupBeforeRepair: () => createHealthCheckBackup(db),
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[DB] Periodic health-check failed:", message);
+    }
+  }, intervalMs);
+  dbHealthCheckTimer.unref?.();
+}
+
+export function runManagedDbHealthCheck(options?: { autoRepair?: boolean }) {
+  const db = getDbInstance();
+  return runDbHealthCheck(db, {
+    autoRepair: options?.autoRepair === true,
+    expectedSchemaVersion: "1",
+    createBackupBeforeRepair: () => createHealthCheckBackup(db),
+  });
 }
 
 export function getDbInstance(): SqliteDatabase {
@@ -424,6 +558,7 @@ export function getDbInstance(): SqliteDatabase {
     memoryDb.pragma("journal_mode = WAL");
     memoryDb.exec(SCHEMA_SQL);
     ensureUsageHistoryColumns(memoryDb);
+    ensureCallLogsColumns(memoryDb);
     setDb(memoryDb);
     return memoryDb;
   }
@@ -488,9 +623,13 @@ export function getDbInstance(): SqliteDatabase {
       }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
-      console.warn("[DB] Could not probe existing DB, will create fresh:", message);
+      console.warn("[DB] Could not probe existing DB:", message);
+      // SAFETY: Never delete the database — rename to backup so data can be recovered.
+      // The old code would silently destroy all user data on any probe failure.
+      const failedPath = sqliteFile + `.probe-failed-${Date.now()}`;
       try {
-        fs.unlinkSync(sqliteFile);
+        fs.renameSync(sqliteFile, failedPath);
+        console.warn(`[DB] Renamed corrupt DB to ${path.basename(failedPath)}`);
       } catch {
         /* ok */
       }
@@ -524,6 +663,37 @@ export function getDbInstance(): SqliteDatabase {
       "combo_sort_order"
     );
   }
+  if (hasColumn(db, "call_logs", "request_type")) {
+    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
+      "007",
+      "search_request_type"
+    );
+  }
+  if (hasColumn(db, "call_logs", "requested_model")) {
+    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
+      "009",
+      "requested_model"
+    );
+  }
+  if (
+    hasColumn(db, "call_logs", "tokens_cache_read") &&
+    hasColumn(db, "call_logs", "tokens_cache_creation") &&
+    hasColumn(db, "call_logs", "tokens_reasoning")
+  ) {
+    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
+      "018",
+      "call_logs_detailed_tokens"
+    );
+  }
+  if (
+    hasColumn(db, "call_logs", "combo_step_id") &&
+    hasColumn(db, "call_logs", "combo_execution_key")
+  ) {
+    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
+      "021",
+      "combo_call_log_targets"
+    );
+  }
   runMigrations(db);
 
   // Auto-migrate from db.json if exists
@@ -536,13 +706,22 @@ export function getDbInstance(): SqliteDatabase {
     "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('schema_version', '1')"
   );
   versionStmt.run();
+  if (shouldRunStartupDbHealthCheck()) {
+    runDbHealthCheck(db, {
+      autoRepair: true,
+      expectedSchemaVersion: "1",
+      createBackupBeforeRepair: () => createHealthCheckBackup(db),
+    });
+  }
 
   setDb(db);
+  startDbHealthCheckScheduler(db);
   console.log(`[DB] SQLite database ready: ${sqliteFile}`);
   return db;
 }
 
 export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | null }): boolean {
+  clearDbHealthCheckScheduler();
   const db = getDb();
   if (!db) return false;
 

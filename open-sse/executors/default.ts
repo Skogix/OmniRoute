@@ -7,7 +7,43 @@ import {
   CLAUDE_CODE_COMPATIBLE_DEFAULT_CHAT_PATH,
   joinClaudeCodeCompatibleUrl,
 } from "../services/claudeCodeCompatible.ts";
+import { getGigachatAccessToken } from "../services/gigachatAuth.ts";
 import { getOpenAICompatibleType, isClaudeCodeCompatible } from "../services/provider.ts";
+import { sanitizeQwenThinkingToolChoice } from "../services/qwenThinking.ts";
+
+function normalizeBaseUrl(baseUrl) {
+  return (baseUrl || "").trim().replace(/\/$/, "");
+}
+
+function normalizeBailianMessagesUrl(baseUrl) {
+  const normalized = normalizeBaseUrl(baseUrl).replace(/\?beta=true$/, "");
+  const messagesUrl = normalized.endsWith("/messages") ? normalized : `${normalized}/messages`;
+  return `${messagesUrl}?beta=true`;
+}
+
+function normalizeHerokuChatUrl(baseUrl) {
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (normalized.endsWith("/v1/chat/completions")) return normalized;
+  return `${normalized}/v1/chat/completions`;
+}
+
+function normalizeDatabricksChatUrl(baseUrl) {
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (normalized.endsWith("/chat/completions")) return normalized;
+  return `${normalized}/chat/completions`;
+}
+
+function normalizeSnowflakeChatUrl(baseUrl) {
+  const normalized = normalizeBaseUrl(baseUrl)
+    .replace(/\/cortex\/inference:complete$/, "")
+    .replace(/\/api\/v2$/, "");
+  return `${normalized}/api/v2/cortex/inference:complete`;
+}
+
+function normalizeGigachatChatUrl(baseUrl) {
+  const normalized = normalizeBaseUrl(baseUrl).replace(/\/chat\/completions$/, "");
+  return `${normalized}/chat/completions`;
+}
 
 export class DefaultExecutor extends BaseExecutor {
   constructor(provider) {
@@ -44,6 +80,26 @@ export class DefaultExecutor extends BaseExecutor {
       return `${normalized}${customPath || "/messages"}`;
     }
     switch (this.provider) {
+      case "bailian-coding-plan": {
+        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        return normalizeBailianMessagesUrl(baseUrl);
+      }
+      case "heroku": {
+        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        return normalizeHerokuChatUrl(baseUrl);
+      }
+      case "databricks": {
+        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        return normalizeDatabricksChatUrl(baseUrl);
+      }
+      case "snowflake": {
+        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        return normalizeSnowflakeChatUrl(baseUrl);
+      }
+      case "gigachat": {
+        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        return normalizeGigachatChatUrl(baseUrl);
+      }
       case "claude":
       case "glm":
       case "kimi-coding":
@@ -78,6 +134,19 @@ export class DefaultExecutor extends BaseExecutor {
           ? (headers["x-goog-api-key"] = effectiveKey)
           : (headers["Authorization"] = `Bearer ${credentials.accessToken}`);
         break;
+      case "snowflake": {
+        const rawToken = effectiveKey || credentials.accessToken || "";
+        const usesProgrammaticAccessToken = rawToken.startsWith("pat/");
+        headers["Authorization"] =
+          `Bearer ${usesProgrammaticAccessToken ? rawToken.slice(4) : rawToken}`;
+        headers["X-Snowflake-Authorization-Token-Type"] = usesProgrammaticAccessToken
+          ? "PROGRAMMATIC_ACCESS_TOKEN"
+          : "KEYPAIR_JWT";
+        break;
+      }
+      case "gigachat":
+        headers["Authorization"] = `Bearer ${credentials.accessToken || effectiveKey}`;
+        break;
       case "claude":
         effectiveKey
           ? (headers["x-api-key"] = effectiveKey)
@@ -111,7 +180,7 @@ export class DefaultExecutor extends BaseExecutor {
         }
     }
 
-    if (stream) headers["Accept"] = "text/event-stream";
+    headers["Accept"] = stream ? "text/event-stream" : "application/json";
 
     // Qwen header cleanup: Remove X-Dashscope-* headers if using an API key (DashScope compatible mode).
     // If using OAuth (Qwen Code), we MUST keep them for portal.qwen.ai to accept the request.
@@ -135,6 +204,12 @@ export class DefaultExecutor extends BaseExecutor {
    * "org/model-name") — we must NOT strip path segments. (Fix #493)
    */
   transformRequest(model, body, stream, credentials) {
+    void model;
+    void stream;
+    void credentials;
+    if (this.provider === "qwen" && typeof body === "object" && body !== null) {
+      return sanitizeQwenThinkingToolChoice(body, "QwenExecutor");
+    }
     return body;
   }
 
@@ -144,6 +219,17 @@ export class DefaultExecutor extends BaseExecutor {
    * race-condition protection (deduplication via refreshPromiseCache).
    */
   async refreshCredentials(credentials, log) {
+    if (this.provider === "gigachat") {
+      if (!credentials.apiKey) return null;
+      try {
+        return await getGigachatAccessToken({
+          credentials: credentials.apiKey,
+        });
+      } catch (error) {
+        log?.error?.("TOKEN", `gigachat refresh error: ${error.message}`);
+        return null;
+      }
+    }
     if (!credentials.refreshToken) return null;
     try {
       return await getAccessToken(this.provider, credentials, log);
@@ -151,6 +237,14 @@ export class DefaultExecutor extends BaseExecutor {
       log?.error?.("TOKEN", `${this.provider} refresh error: ${error.message}`);
       return null;
     }
+  }
+
+  needsRefresh(credentials) {
+    if (this.provider === "gigachat") {
+      if (credentials.apiKey && !credentials.accessToken) return true;
+      if (!credentials.expiresAt) return false;
+    }
+    return super.needsRefresh(credentials);
   }
 }
 

@@ -12,6 +12,11 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  getComboModelProvider,
+  getComboModelString,
+  getComboStepTarget,
+} from "../../src/lib/combos/steps.ts";
 
 import {
   MCP_TOOLS,
@@ -33,6 +38,7 @@ import {
   bestComboForTaskInput,
   explainRouteInput,
   getSessionSnapshotInput,
+  dbHealthCheckInput,
   syncPricingInput,
 } from "./schemas/tools.ts";
 import { startMcpHeartbeat } from "./runtimeHeartbeat.ts";
@@ -54,6 +60,7 @@ import {
   handleBestComboForTask,
   handleExplainRoute,
   handleGetSessionSnapshot,
+  handleDbHealthCheck,
   handleSyncPricing,
 } from "./tools/advancedTools.ts";
 import { memoryTools } from "./tools/memoryTools.ts";
@@ -105,11 +112,17 @@ function normalizeComboModels(
   rawModels: unknown
 ): Array<{ provider: string; model: string; priority: number }> {
   return toArray(rawModels).map((rawModel, index) => {
-    const model = toRecord(rawModel);
+    const modelRecord = toRecord(rawModel);
+    const modelString = getComboModelString(rawModel);
+    const target = getComboStepTarget(rawModel);
+    const provider =
+      getComboModelProvider(rawModel) ||
+      (modelString ? "unknown" : target ? "combo" : toString(modelRecord.provider, "unknown"));
+
     return {
-      provider: toString(model.provider, "unknown"),
-      model: toString(model.model, "unknown"),
-      priority: toNumber(model.priority, index + 1),
+      provider,
+      model: modelString || target || toString(modelRecord.model, "unknown"),
+      priority: toNumber(modelRecord.priority, index + 1),
     };
   });
 }
@@ -746,6 +759,18 @@ export function createMcpServer(): McpServer {
       getSessionSnapshotInput.parse(args ?? {});
       return handleGetSessionSnapshot();
     })
+  );
+
+  server.registerTool(
+    "omniroute_db_health_check",
+    {
+      description:
+        "Diagnoses or repairs OmniRoute database drift, including broken combo references and orphan quota/domain rows",
+      inputSchema: dbHealthCheckInput,
+    },
+    withScopeEnforcement("omniroute_db_health_check", (args) =>
+      handleDbHealthCheck(dbHealthCheckInput.parse(args ?? {}))
+    )
   );
 
   server.registerTool(

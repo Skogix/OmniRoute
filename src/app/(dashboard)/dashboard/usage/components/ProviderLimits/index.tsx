@@ -15,7 +15,9 @@ import Card from "@/shared/components/Card";
 import Badge from "@/shared/components/Badge";
 import { CardSkeleton } from "@/shared/components/Loading";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
-import { pickMaskedDisplayValue } from "@/shared/utils/maskEmail";
+import { pickMaskedDisplayValue, pickDisplayValue } from "@/shared/utils/maskEmail";
+import useEmailPrivacyStore from "@/store/emailPrivacyStore";
+import EmailPrivacyToggle from "@/shared/components/EmailPrivacyToggle";
 
 const LS_GROUP_BY = "omniroute:limits:groupBy";
 const LS_EXPANDED_GROUPS = "omniroute:limits:expandedGroups";
@@ -79,6 +81,7 @@ function formatCountdown(resetAt) {
 
 export default function ProviderLimits() {
   const t = useTranslations("usage");
+  const emailsVisible = useEmailPrivacyStore((s) => s.emailsVisible);
   const [connections, setConnections] = useState([]);
   const [quotaData, setQuotaData] = useState({});
   const [loading, setLoading] = useState({});
@@ -427,6 +430,7 @@ export default function ProviderLimits() {
             {visibleConnections.length !== sortedConnections.length &&
               ` ${t("filteredFromCount", { count: sortedConnections.length })}`}
           </span>
+          <EmailPrivacyToggle />
         </div>
 
         <div className="flex items-center gap-2">
@@ -546,8 +550,9 @@ export default function ProviderLimits() {
                   </div>
                   <div className="min-w-0">
                     <div className="text-[13px] font-semibold text-text-main truncate">
-                      {pickMaskedDisplayValue(
+                      {pickDisplayValue(
                         [conn.name, conn.displayName, conn.email],
+                        emailsVisible,
                         config.label
                       )}
                     </div>
@@ -607,48 +612,70 @@ export default function ProviderLimits() {
                       return (
                         <div
                           key={i}
-                          className={`flex items-center gap-1.5 min-w-[200px] shrink-0 ${
+                          className={`flex items-center gap-1.5 shrink-0 ${
                             i > 0 ? "border-l border-border/80 pl-3 ml-1" : ""
                           }`}
                         >
-                          {/* Model label */}
-                          <span
-                            title={q.modelKey || q.name}
-                            className="text-[11px] font-semibold py-0.5 px-2 rounded whitespace-nowrap min-w-[60px] text-center"
-                            style={{ background: colors.bg, color: colors.text }}
-                          >
-                            {shortName}
-                          </span>
+                          {q.isCredits ? (
+                            /* ── AI Credits counter ── */
+                            <>
+                              <span
+                                className="text-[11px] font-semibold py-0.5 px-2 rounded whitespace-nowrap"
+                                style={{ background: colors.bg, color: colors.text }}
+                              >
+                                🪙 {formatQuotaLabel(q.name)}
+                              </span>
+                              <span
+                                className="text-[12px] font-bold tabular-nums"
+                                style={{ color: colors.text }}
+                              >
+                                {q.creditCount ?? q.remaining}
+                              </span>
+                              <span className="text-[10px] text-text-muted">left</span>
+                            </>
+                          ) : (
+                            /* ── Standard quota bar ── */
+                            <>
+                              {/* Model label */}
+                              <span
+                                title={q.modelKey || q.name}
+                                className="text-[11px] font-semibold py-0.5 px-2 rounded whitespace-nowrap min-w-[60px] text-center"
+                                style={{ background: colors.bg, color: colors.text }}
+                              >
+                                {shortName}
+                              </span>
 
-                          {/* Countdown */}
-                          {staleAfterReset ? (
-                            <span className="text-[10px] text-text-muted whitespace-nowrap">
-                              ⟳ Refreshing...
-                            </span>
-                          ) : cd ? (
-                            <span className="text-[10px] text-text-muted whitespace-nowrap">
-                              ⏱ {cd}
-                            </span>
-                          ) : null}
+                              {/* Countdown */}
+                              {staleAfterReset ? (
+                                <span className="text-[10px] text-text-muted whitespace-nowrap">
+                                  ⟳ Refreshing...
+                                </span>
+                              ) : cd ? (
+                                <span className="text-[10px] text-text-muted whitespace-nowrap">
+                                  ⏱ {cd}
+                                </span>
+                              ) : null}
 
-                          {/* Progress bar */}
-                          <div className="flex-1 h-1.5 rounded-sm bg-black/[0.06] dark:bg-white/[0.06] min-w-[60px] overflow-hidden">
-                            <div
-                              className="h-full rounded-sm transition-[width] duration-300 ease-out"
-                              style={{
-                                width: `${Math.min(remainingPercentage, 100)}%`,
-                                background: colors.bar,
-                              }}
-                            />
-                          </div>
+                              {/* Progress bar */}
+                              <div className="flex-1 h-1.5 rounded-sm bg-black/[0.06] dark:bg-white/[0.06] min-w-[60px] overflow-hidden">
+                                <div
+                                  className="h-full rounded-sm transition-[width] duration-300 ease-out"
+                                  style={{
+                                    width: `${Math.min(remainingPercentage, 100)}%`,
+                                    background: colors.bar,
+                                  }}
+                                />
+                              </div>
 
-                          {/* Percentage */}
-                          <span
-                            className="text-[11px] font-semibold min-w-[32px] text-right"
-                            style={{ color: colors.text }}
-                          >
-                            {remainingPercentage}%
-                          </span>
+                              {/* Percentage */}
+                              <span
+                                className="text-[11px] font-semibold min-w-[32px] text-right"
+                                style={{ color: colors.text }}
+                              >
+                                {remainingPercentage}%
+                              </span>
+                            </>
+                          )}
                         </div>
                       );
                     })

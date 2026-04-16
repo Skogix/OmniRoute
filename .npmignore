@@ -28,6 +28,8 @@ scripts/
 .vscode/
 .agents/
 .env*
+app/.env
+app/.env*
 eslint.config.mjs
 prettier.config.mjs
 postcss.config.mjs
@@ -67,3 +69,6 @@ clipr/
 omnirouteCloud/
 omnirouteSite/
 vscode-extension/
+
+# Root-level underscore-prefixed directories (private/draft — never publish)
+/_*/

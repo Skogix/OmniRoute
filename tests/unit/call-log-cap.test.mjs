@@ -41,6 +41,9 @@ test("call logs store a single per-request artifact with pipeline details", asyn
     requestedModel: "openai/gpt-5",
     provider: "openai",
     duration: 42,
+    comboName: "combo-a",
+    comboStepId: "step-openai-a",
+    comboExecutionKey: "combo-a:0:step-openai-a",
     requestBody: { messages: [{ role: "user", content: "hello" }] },
     responseBody: { id: "resp_1", choices: [{ message: { content: "world" } }] },
     pipelinePayloads: {
@@ -57,6 +60,9 @@ test("call logs store a single per-request artifact with pipeline details", asyn
 
   const detail = await callLogs.getCallLogById(logId);
   assert.equal(detail?.requestedModel, "openai/gpt-5");
+  assert.equal(detail?.comboName, "combo-a");
+  assert.equal(detail?.comboStepId, "step-openai-a");
+  assert.equal(detail?.comboExecutionKey, "combo-a:0:step-openai-a");
   assert.equal(detail?.pipelinePayloads?.clientRawRequest?.body?.raw, true);
   assert.equal(detail?.pipelinePayloads?.providerRequest?.body?.translated, true);
   assert.equal(detail?.pipelinePayloads?.providerResponse?.body?.upstream, true);
@@ -70,6 +76,9 @@ test("call logs store a single per-request artifact with pipeline details", asyn
   const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
   assert.equal(artifact.summary.id, logId);
   assert.equal(artifact.summary.requestedModel, "openai/gpt-5");
+  assert.equal(artifact.summary.comboName, "combo-a");
+  assert.equal(artifact.summary.comboStepId, "step-openai-a");
+  assert.equal(artifact.summary.comboExecutionKey, "combo-a:0:step-openai-a");
   assert.equal(artifact.pipeline.clientRawRequest.body.raw, true);
   assert.equal("sourceRequest" in artifact.pipeline, false);
 });
@@ -434,6 +443,64 @@ test("getCallLogById returns legacy pipeline details even when no legacy disk ar
   assert.equal(detail?.hasPipelineDetails, true);
 });
 
+test("saveCallLog keeps payloads below 256KB inline in sqlite", async () => {
+  const requestBody = { payload: "x".repeat(64 * 1024) };
+  const responseBody = { payload: "y".repeat(96 * 1024) };
+
+  await callLogs.saveCallLog({
+    id: "inline-payload-limit",
+    timestamp: "2026-03-31T09:00:00.000Z",
+    method: "POST",
+    path: "/v1/chat/completions",
+    status: 200,
+    model: "openai/gpt-4.1",
+    provider: "openai",
+    duration: 5,
+    requestBody,
+    responseBody,
+  });
+
+  const db = core.getDbInstance();
+  const row = db
+    .prepare("SELECT request_body, response_body FROM call_logs WHERE id = ?")
+    .get("inline-payload-limit");
+  const storedRequest = JSON.parse(row.request_body);
+  const storedResponse = JSON.parse(row.response_body);
+
+  assert.equal(storedRequest._truncated, undefined);
+  assert.equal(storedResponse._truncated, undefined);
+
+  const detail = await callLogs.getCallLogById("inline-payload-limit");
+  assert.equal(detail?.requestBody?.payload?.length, requestBody.payload.length);
+  assert.equal(detail?.responseBody?.payload?.length, responseBody.payload.length);
+});
+
+test("saveCallLog still truncates oversized inline sqlite payloads above 256KB", async () => {
+  const requestBody = { payload: "x".repeat(320 * 1024) };
+
+  await callLogs.saveCallLog({
+    id: "truncated-inline-payload-limit",
+    timestamp: "2026-03-31T09:05:00.000Z",
+    method: "POST",
+    path: "/v1/chat/completions",
+    status: 500,
+    model: "openai/gpt-4.1",
+    provider: "openai",
+    duration: 7,
+    requestBody,
+  });
+
+  const db = core.getDbInstance();
+  const row = db
+    .prepare("SELECT request_body FROM call_logs WHERE id = ?")
+    .get("truncated-inline-payload-limit");
+  const storedRequest = JSON.parse(row.request_body);
+
+  assert.equal(storedRequest._truncated, true);
+  assert.equal(storedRequest._preview.length, 256 * 1024);
+  assert.ok(storedRequest._originalSize > storedRequest._preview.length);
+});
+
 test("saveCallLog logs and returns when sqlite persistence throws unexpectedly", async () => {
   const db = core.getDbInstance();
   const originalPrepare = db.prepare;
@@ -468,4 +535,32 @@ test("saveCallLog logs and returns when sqlite persistence throws unexpectedly",
   assert.equal(consoleCalls.length, 1);
   assert.match(consoleCalls[0], /Failed to save call log/);
   assert.match(consoleCalls[0], /simulated sqlite prepare failure/);
+});
+
+test("getCallLogs and getCallLogById expose combo target identifiers", async () => {
+  await callLogs.saveCallLog({
+    id: "combo-target-log",
+    timestamp: "2026-03-31T08:15:00.000Z",
+    method: "POST",
+    path: "/v1/chat/completions",
+    status: 503,
+    model: "openai/gpt-4o-mini",
+    requestedModel: "router-fixed-accounts",
+    provider: "openai",
+    connectionId: "conn-fixed-2",
+    comboName: "router-fixed-accounts",
+    comboStepId: "step-openai-secondary",
+    comboExecutionKey: "router-fixed-accounts:1:step-openai-secondary",
+    error: "upstream unavailable",
+  });
+
+  const logs = await callLogs.getCallLogs({ search: "step-openai-secondary" });
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].comboStepId, "step-openai-secondary");
+  assert.equal(logs[0].comboExecutionKey, "router-fixed-accounts:1:step-openai-secondary");
+
+  const detail = await callLogs.getCallLogById("combo-target-log");
+  assert.equal(detail?.comboName, "router-fixed-accounts");
+  assert.equal(detail?.comboStepId, "step-openai-secondary");
+  assert.equal(detail?.comboExecutionKey, "router-fixed-accounts:1:step-openai-secondary");
 });

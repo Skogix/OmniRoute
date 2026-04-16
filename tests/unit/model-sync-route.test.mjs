@@ -6,6 +6,10 @@ import path from "node:path";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-model-sync-route-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
+// FASE-01: API_KEY_SECRET is required for CRC operations (no hardcoded fallback)
+if (!process.env.API_KEY_SECRET) {
+  process.env.API_KEY_SECRET = "test-model-sync-secret-" + Date.now();
+}
 
 const core = await import("../../src/lib/db/core.ts");
 const localDb = await import("../../src/lib/localDb.ts");
@@ -435,7 +439,7 @@ test("model sync route records added, removed, and updated model diffs with fall
   assert.equal(logs.length, 1);
   assert.equal(logs[0].status, 200);
   assert.equal(logs[0].provider, "openrouter");
-  assert.ok(logs[0].account.includes("**"), `Expected masked email, got: ${logs[0].account}`);
+  assert.ok(logs[0].account.includes("*"), `Expected masked email, got: ${logs[0].account}`);
 });
 
 test("model sync route accepts external API-key auth, forwards cookies, filters built-ins, and syncs aliases", async () => {

@@ -74,6 +74,7 @@ async function invokeResponsesCore({
   model = "gpt-4o-mini",
   credentials,
   responseFactory,
+  signal,
 } = {}) {
   const calls = [];
 
@@ -101,6 +102,7 @@ async function invokeResponsesCore({
       onRequestSuccess: null,
       onDisconnect: null,
       connectionId: null,
+      signal,
     });
 
     return { result, calls, call: calls.at(-1) };
@@ -173,6 +175,30 @@ test("handleResponsesCore preserves previous_response_id and handles empty input
   assert.equal(call.body.stream, true);
 });
 
+test("handleResponsesCore preserves store for Codex responses when connection opt-in is enabled", async () => {
+  const { call, result } = await invokeResponsesCore({
+    body: {
+      model: "gpt-5.3-codex",
+      input: [],
+      previous_response_id: "resp_prev_store",
+      store: true,
+    },
+    provider: "codex",
+    model: "gpt-5.3-codex",
+    credentials: {
+      accessToken: "codex-token",
+      providerSpecificData: {
+        openaiStoreEnabled: true,
+      },
+    },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(call.body.previous_response_id, "resp_prev_store");
+  assert.equal(call.body.store, true);
+  assert.equal(call.body.stream, true);
+});
+
 test("handleResponsesCore transforms upstream OpenAI SSE into Responses API SSE", async () => {
   const { result } = await invokeResponsesCore({
     body: {
@@ -232,4 +258,100 @@ test("handleResponsesCore rejects invalid Responses API input that cannot be tra
       error instanceof Error &&
       error.message.includes("web_search_preview tool type is not supported")
   );
+});
+
+test("handleResponsesCore injects SSE keepalive comments for Responses streams", async () => {
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const intervals = [];
+  let nextId = 0;
+
+  globalThis.setInterval = (callback, delay = 0, ...args) => {
+    const interval = {
+      id: ++nextId,
+      callback,
+      delay,
+      args,
+      cleared: false,
+    };
+    intervals.push(interval);
+    return interval;
+  };
+
+  globalThis.clearInterval = (interval) => {
+    if (interval && typeof interval === "object") {
+      interval.cleared = true;
+    }
+  };
+
+  try {
+    const { result } = await invokeResponsesCore({
+      body: {
+        model: "gpt-4o-mini",
+        input: "hello",
+      },
+    });
+
+    assert.equal(result.success, true);
+    const heartbeatInterval = intervals.find((interval) => interval.delay === 15000);
+    assert.ok(heartbeatInterval, "expected a 15s heartbeat interval");
+
+    await heartbeatInterval.callback(...heartbeatInterval.args);
+    const sse = await result.response.text();
+
+    assert.match(sse, /^: keepalive .*$/m);
+    assert.match(sse, /event: response\.created/);
+    assert.match(sse, /data: \[DONE\]/);
+    assert.equal(heartbeatInterval.cleared, true);
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  }
+});
+
+test("handleResponsesCore clears heartbeat timers immediately when the request signal aborts", async () => {
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const intervals = [];
+  let nextId = 0;
+
+  globalThis.setInterval = (callback, delay = 0, ...args) => {
+    const interval = {
+      id: ++nextId,
+      callback,
+      delay,
+      args,
+      cleared: false,
+    };
+    intervals.push(interval);
+    return interval;
+  };
+
+  globalThis.clearInterval = (interval) => {
+    if (interval && typeof interval === "object") {
+      interval.cleared = true;
+    }
+  };
+
+  try {
+    const controller = new AbortController();
+    const { result } = await invokeResponsesCore({
+      body: {
+        model: "gpt-4o-mini",
+        input: "hello",
+      },
+      signal: controller.signal,
+    });
+
+    assert.equal(result.success, true);
+    const heartbeatInterval = intervals.find((interval) => interval.delay === 15000);
+    assert.ok(heartbeatInterval, "expected a 15s heartbeat interval");
+
+    controller.abort();
+    assert.equal(heartbeatInterval.cleared, true);
+    await result.response.body?.cancel();
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  }
 });

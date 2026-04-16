@@ -1,7 +1,8 @@
 import { HTTP_STATUS, FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { applyFingerprint, isCliCompatEnabled } from "../config/cliFingerprints.ts";
 import { getRotatingApiKey } from "../services/apiKeyRotator.ts";
-import { getOpenAICompatibleType } from "../services/provider.ts";
+import { getOpenAICompatibleType, isClaudeCodeCompatible } from "../services/provider.ts";
+import { signRequestBody } from "../services/claudeCodeCCH.ts";
 
 /**
  * Sanitizes a custom API path to prevent path traversal attacks.
@@ -206,9 +207,7 @@ export class BaseExecutor {
       headers["Authorization"] = `Bearer ${effectiveKey}`;
     }
 
-    if (stream) {
-      headers["Accept"] = "text/event-stream";
-    }
+    headers["Accept"] = stream ? "text/event-stream" : "application/json";
 
     return headers;
   }
@@ -240,8 +239,8 @@ export class BaseExecutor {
     return null;
   }
 
-  needsRefresh(credentials: ProviderCredentials) {
-    if (!credentials.expiresAt) return false;
+  needsRefresh(credentials?: ProviderCredentials | null) {
+    if (!credentials?.expiresAt) return false;
     const expiresAtMs = new Date(credentials.expiresAt).getTime();
     return expiresAtMs - Date.now() < 5 * 60 * 1000;
   }
@@ -263,13 +262,31 @@ export class BaseExecutor {
     const fallbackCount = this.getFallbackCount();
     let lastError: unknown = null;
     let lastStatus = 0;
+    let activeCredentials = credentials;
     // Track per-URL intra-retry attempts to avoid infinite loops
     const retryAttemptsByUrl: Record<number, number> = {};
 
+    if (this.needsRefresh(credentials)) {
+      try {
+        const refreshed = await this.refreshCredentials(credentials, log || null);
+        if (refreshed) {
+          activeCredentials = {
+            ...credentials,
+            ...refreshed,
+          };
+        }
+      } catch (error) {
+        log?.warn?.(
+          "TOKEN",
+          `Credential refresh failed for ${this.provider}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
-      const url = this.buildUrl(model, stream, urlIndex, credentials);
-      const headers = this.buildHeaders(credentials, stream);
-      applyConfiguredUserAgent(headers, credentials?.providerSpecificData);
+      const url = this.buildUrl(model, stream, urlIndex, activeCredentials);
+      const headers = this.buildHeaders(activeCredentials, stream);
+      applyConfiguredUserAgent(headers, activeCredentials?.providerSpecificData);
 
       // Append 1M context beta header when [1m] suffix was used
       // Only supported for specific Claude models per Anthropic docs
@@ -293,7 +310,7 @@ export class BaseExecutor {
         }
       }
 
-      const transformedBody = await this.transformRequest(model, body, stream, credentials);
+      const transformedBody = await this.transformRequest(model, body, stream, activeCredentials);
 
       try {
         // Apply timeout to all requests. Non-streaming requests need this to prevent
@@ -311,6 +328,13 @@ export class BaseExecutor {
           const fingerprinted = applyFingerprint(this.provider, headers, transformedBody);
           finalHeaders = fingerprinted.headers;
           bodyString = fingerprinted.bodyString;
+        }
+
+        // CCH signing: Claude Code-compatible providers require an xxHash64 integrity
+        // token over the serialized body. Sign after fingerprint ordering so the hash
+        // covers the exact bytes that will be sent upstream.
+        if (isClaudeCodeCompatible(this.provider)) {
+          bodyString = await signRequestBody(bodyString);
         }
 
         mergeUpstreamExtraHeaders(finalHeaders, upstreamExtraHeaders);

@@ -42,6 +42,7 @@ export const UNSUPPORTED_SCHEMA_CONSTRAINTS = [
   "contentMediaType",
   "contentEncoding",
   // Non-standard schema fields (not recognized by Gemini API)
+  "deprecated",
   "optional",
   // UI/Styling properties (from Cursor tools - NOT JSON Schema standard)
   "cornerRadius",
@@ -100,11 +101,18 @@ export function convertOpenAIContentToParts(content) {
         }
 
         // 3. Handle raw data strings (e.g. {"type": "file", "data": "JVBER...", "mime_type": "..."})
-        if (typeof item.data === "string" && !item.data.startsWith("http")) {
-          const rawData = item.data.replace(/^data:[a-zA-Z0-9/+-]+;base64,/, "");
+        const rawDataStr = item.data || item.file?.data || item.document?.data;
+        const mimeTypeFallback =
+          item.mime_type ||
+          item.media_type ||
+          item.file?.mime_type ||
+          item.document?.mime_type ||
+          "application/octet-stream";
+        if (typeof rawDataStr === "string" && !rawDataStr.startsWith("http")) {
+          const rawData = rawDataStr.replace(/^data:[a-zA-Z0-9/+-]+;base64,/, "");
           parts.push({
             inlineData: {
-              mimeType: item.mime_type || item.media_type || "application/octet-stream",
+              mimeType: mimeTypeFallback,
               data: rawData,
             },
           });
@@ -178,9 +186,9 @@ function removeUnsupportedKeywords(obj, keywords) {
     }
   } else {
     // Delete unsupported keys at current level
-    for (const keyword of keywords) {
-      if (keyword in obj) {
-        delete obj[keyword];
+    for (const key of Object.keys(obj)) {
+      if (keywords.includes(key) || key.startsWith("x-")) {
+        delete obj[key];
       }
     }
     // Recurse into remaining values

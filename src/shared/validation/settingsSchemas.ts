@@ -8,6 +8,22 @@
 import { z } from "zod";
 import { HIDEABLE_SIDEBAR_ITEM_IDS } from "@/shared/constants/sidebarVisibility";
 
+const fallbackStrategyValues = [
+  "priority",
+  "weighted",
+  "round-robin",
+  "context-relay",
+  "fill-first",
+  "p2c",
+  "random",
+  "least-used",
+  "cost-optimized",
+  "strict-random",
+  "auto",
+  "context-optimized",
+  "lkgp",
+] as const;
+
 export const updateSettingsSchema = z.object({
   newPassword: z.string().min(1).max(200).optional(),
   currentPassword: z.string().max(200).optional(),
@@ -30,9 +46,7 @@ export const updateSettingsSchema = z.object({
   debugMode: z.boolean().optional(),
   hiddenSidebarItems: z.array(z.enum(HIDEABLE_SIDEBAR_ITEM_IDS)).optional(),
   // Routing settings (#134)
-  fallbackStrategy: z
-    .enum(["fill-first", "round-robin", "p2c", "random", "least-used", "cost-optimized"])
-    .optional(),
+  fallbackStrategy: z.enum(fallbackStrategyValues).optional(),
   wildcardAliases: z.array(z.object({ pattern: z.string(), target: z.string() })).optional(),
   stickyRoundRobinLimit: z.number().int().min(0).max(1000).optional(),
   // Auto intent classifier settings (multilingual routing)
@@ -74,5 +88,8 @@ export const updateSettingsSchema = z.object({
   skillsmpApiKey: z.string().max(200).optional(),
   // models.dev sync settings
   modelsDevSyncEnabled: z.boolean().optional(),
-  modelsDevSyncInterval: z.number().int().min(3600).max(604800).optional(),
+  modelsDevSyncInterval: z.number().int().min(1000).max(604800000).optional(),
+  // Missing settings
+  lkgpEnabled: z.boolean().optional(),
+  backgroundDegradation: z.unknown().optional(),
 });

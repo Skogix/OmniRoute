@@ -51,12 +51,13 @@ import {
   getModelPreserveOpenAIDeveloperRole,
   getModelUpstreamExtraHeaders,
   getUpstreamProxyConfig,
+  getCachedSettings,
 } from "@/lib/localDb";
 import { getExecutor } from "../executors/index.ts";
-import { getCacheControlSettings } from "@/lib/cacheControlSettings";
 import {
   shouldPreserveCacheControl,
   providerSupportsCaching,
+  type CacheControlMode,
 } from "../utils/cacheControlPolicy.ts";
 import { getCacheMetrics } from "@/lib/db/settings.ts";
 
@@ -128,6 +129,11 @@ import {
   isClaudeCodeCompatibleProvider,
   resolveClaudeCodeCompatibleSessionId,
 } from "../services/claudeCodeCompatible.ts";
+import { remapToolNamesInRequest } from "../services/claudeCodeToolRemapper.ts";
+import {
+  enforceThinkingTemperature,
+  disableThinkingIfToolChoiceForced,
+} from "../services/claudeCodeConstraints.ts";
 
 function extractMemoryTextFromResponse(
   response: Record<string, unknown> | null | undefined
@@ -478,6 +484,8 @@ export async function handleChatCore({
   comboName,
   comboStrategy = null,
   isCombo = false,
+  comboStepId = null,
+  comboExecutionKey = null,
   disableEmergencyFallback = false,
 }) {
   let { provider, model, extendedContext } = modelInfo;
@@ -745,6 +753,8 @@ export async function handleChatCore({
       sourceFormat,
       targetFormat,
       comboName,
+      comboStepId,
+      comboExecutionKey,
       apiKeyId: apiKeyInfo?.id || null,
       apiKeyName: apiKeyInfo?.name || null,
       noLog: noLogEnabled,
@@ -807,12 +817,20 @@ export async function handleChatCore({
     delete b.disable_stream;
     delete b.disable_streaming;
     delete b.streaming;
+    delete b.prompt_cache_retention;
   }
 
   const stream = resolveStreamFlag(body?.stream, acceptHeader);
+  const runtimeSettings = await getCachedSettings().catch(() => ({}) as Record<string, unknown>);
+  const semanticCacheEnabled = runtimeSettings.semanticCacheEnabled !== false;
+  const cacheControlMode =
+    runtimeSettings.alwaysPreserveClientCache === "always" ||
+    runtimeSettings.alwaysPreserveClientCache === "never"
+      ? (runtimeSettings.alwaysPreserveClientCache as CacheControlMode)
+      : "auto";
 
   // ── Phase 9.1: Semantic cache check (non-streaming, temp=0 only) ──
-  if (isCacheable(body, clientRawRequest?.headers)) {
+  if (semanticCacheEnabled && isCacheable(body, clientRawRequest?.headers)) {
     const signature = generateSignature(model, body.messages, body.temperature, body.top_p);
     const cached = getCachedResponse(signature);
     if (cached) {
@@ -944,12 +962,13 @@ export async function handleChatCore({
   let translatedBody = body;
   const isClaudePassthrough = sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.CLAUDE;
   const isClaudeCodeCompatible = isClaudeCodeCompatibleProvider(provider);
-  const upstreamStream = stream || isClaudeCodeCompatible;
+  // Respect the client's explicit non-streaming intent for CC-compatible providers.
+  // Most upstreams can answer JSON directly; the SSE->JSON fallback remains as a
+  // compatibility path when an upstream still responds with event-stream.
+  const upstreamStream = stream;
   let ccSessionId: string | null = null;
 
   // Determine if we should preserve client-side cache_control headers
-  // Fetch settings from DB to get user preference
-  const cacheControlMode = await getCacheControlSettings().catch(() => "auto" as const);
   const preserveCacheControl = shouldPreserveCacheControl({
     userAgent,
     isCombo,
@@ -1011,6 +1030,17 @@ export async function handleChatCore({
         now: new Date(),
         preserveCacheControl,
       });
+
+      // Apply PR #1188 parity pipeline (synchronous steps — CCH signing is async and
+      // runs later in BaseExecutor over the serialized string).
+      // Only thinking constraints and tool remapping are applied here; cache-control
+      // limit enforcement (enforceCacheControlLimit) is intentionally omitted because
+      // the billing-header system block added by buildClaudeCodeCompatibleRequest counts
+      // toward the 4-block cap and would strip legitimate client cache markers.
+      remapToolNamesInRequest(translatedBody);
+      enforceThinkingTemperature(translatedBody);
+      disableThinkingIfToolChoiceForced(translatedBody);
+
       log?.debug?.("FORMAT", "claude-code-compatible bridge enabled");
     } else if (isClaudePassthrough && preserveCacheControl) {
       // Pure passthrough: when preserveCacheControl is true, forward the body
@@ -1979,6 +2009,7 @@ export async function handleChatCore({
     trackPendingRequest(model, provider, connectionId, false);
     const contentType = (providerResponse.headers.get("content-type") || "").toLowerCase();
     let responseBody;
+    let responseFormatForTranslation = targetFormat;
     const rawBody = await providerResponse.text();
     const normalizedProviderPayload = normalizePayloadForLog(rawBody);
     const looksLikeSSE =
@@ -1986,10 +2017,19 @@ export async function handleChatCore({
 
     if (looksLikeSSE) {
       // Upstream returned SSE even though stream=false; convert best-effort to JSON.
+      const looksLikeResponsesSSE =
+        targetFormat === FORMATS.OPENAI_RESPONSES ||
+        provider === "codex" ||
+        /(^|\n)\s*(?:event:\s*response\.|data:\s*\{.*"type"\s*:\s*"response\.)/m.test(rawBody);
+      responseFormatForTranslation = looksLikeResponsesSSE
+        ? FORMATS.OPENAI_RESPONSES
+        : targetFormat === FORMATS.CLAUDE
+          ? FORMATS.CLAUDE
+          : FORMATS.OPENAI;
       const parsedFromSSE =
-        targetFormat === FORMATS.OPENAI_RESPONSES
+        responseFormatForTranslation === FORMATS.OPENAI_RESPONSES
           ? parseSSEToResponsesOutput(rawBody, model)
-          : targetFormat === FORMATS.CLAUDE
+          : responseFormatForTranslation === FORMATS.CLAUDE
             ? parseSSEToClaudeResponse(rawBody, model)
             : parseSSEToOpenAIResponse(rawBody, model);
 
@@ -2181,10 +2221,10 @@ export async function handleChatCore({
 
     // Translate response to client's expected format (usually OpenAI)
     // Pass toolNameMap so Claude OAuth proxy_ prefix is stripped in tool_use blocks (#605)
-    let translatedResponse = needsTranslation(targetFormat, clientResponseFormat)
+    let translatedResponse = needsTranslation(responseFormatForTranslation, clientResponseFormat)
       ? translateNonStreamingResponse(
           responseBody,
-          targetFormat,
+          responseFormatForTranslation,
           clientResponseFormat,
           toolNameMap as Map<string, string> | null
         )
@@ -2269,7 +2309,7 @@ export async function handleChatCore({
     }
 
     // ── Phase 9.1: Cache store (non-streaming, temp=0) ──
-    if (isCacheable(body, clientRawRequest?.headers)) {
+    if (semanticCacheEnabled && isCacheable(body, clientRawRequest?.headers)) {
       const signature = generateSignature(model, body.messages, body.temperature, body.top_p);
       const tokensSaved = usage?.prompt_tokens + usage?.completion_tokens || 0;
       setCachedResponse(signature, model, translatedResponse, tokensSaved);

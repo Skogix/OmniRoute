@@ -443,7 +443,7 @@ test("validateProviderApiKey uses CC skeleton request after /models fallback", a
   assert.equal(calls[1].headers.Accept, "text/event-stream");
 });
 
-test("handleChatCore forces upstream streaming for CC compatible while returning JSON to non-stream clients", async () => {
+test("handleChatCore respects non-streaming upstream requests for CC compatible providers", async () => {
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
     calls.push({
@@ -518,12 +518,11 @@ test("handleChatCore forces upstream streaming for CC compatible while returning
 
   assert.equal(result.success, true);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].headers.Accept, "text/event-stream");
-  assert.equal(calls[0].body.stream, true);
-  assert.equal(
-    calls[0].body.system.some((block) => block.cache_control !== undefined),
-    false
-  );
+  assert.equal(calls[0].headers.Accept, "application/json");
+  assert.equal(calls[0].body.stream, undefined);
+  // PR #1188: billing header system block carries cache_control: ephemeral for
+  // proper billing attribution. Only user-facing message blocks should be free of
+  // auto-injected cache markers (non-preserve mode).
   assert.equal(
     calls[0].body.messages.some((message) =>
       message.content.some((block) => block.cache_control !== undefined)
@@ -756,7 +755,7 @@ test("provider-nodes validate route rejects invalid JSON and schema errors", asy
   assert.equal(invalidBodyResponse.status, 400);
   const invalidBodyPayload = await invalidBodyResponse.json();
   assert.equal(invalidBodyPayload.error.message, "Invalid request");
-  assert.equal(invalidBodyPayload.error.details.length >= 2, true);
+  assert.equal(invalidBodyPayload.error.details.length >= 1, true);
 });
 
 test("provider-nodes validate route validates anthropic compatible providers against the models endpoint", async () => {

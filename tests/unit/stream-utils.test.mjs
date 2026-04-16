@@ -237,6 +237,49 @@ test("createSSEStream passthrough preserves Responses API events and completion 
   assert.equal(onCompletePayload.providerPayload.summary.object, "response");
 });
 
+test("buildStreamSummaryFromEvents falls back to response.output_text.delta when completed output is empty", () => {
+  const summary = buildStreamSummaryFromEvents(
+    [
+      {
+        index: 0,
+        data: {
+          type: "response.output_text.delta",
+          delta: "Hello ",
+        },
+      },
+      {
+        index: 1,
+        data: {
+          type: "response.output_text.delta",
+          delta: "world",
+        },
+      },
+      {
+        index: 2,
+        data: {
+          type: "response.completed",
+          response: {
+            id: "resp_fallback",
+            object: "response",
+            model: "gpt-5.4",
+            status: "completed",
+            output: [],
+            usage: { output_tokens: 2 },
+          },
+        },
+      },
+    ],
+    FORMATS.OPENAI_RESPONSES,
+    "gpt-5.4"
+  );
+
+  assert.equal(summary.object, "response");
+  assert.equal(summary.output[0].type, "message");
+  assert.equal(summary.output[0].content[0].type, "output_text");
+  assert.equal(summary.output[0].content[0].text, "Hello world");
+  assert.equal(summary.usage.output_tokens, 2);
+});
+
 test("createSSEStream translate mode aborts on Responses failure with rate limit error", async () => {
   let onCompletePayload = null;
 
@@ -703,4 +746,40 @@ test("createStructuredSSECollector drops excess events and compactStructuredStre
       droppedEvents: 1,
     },
   });
+});
+
+test("createSSEStream passthrough drops keepalive event blocks without losing Responses deltas", async () => {
+  const text = await readTransformed(
+    [
+      "event: keepalive\ndata:\n\n",
+      `data: ${JSON.stringify({
+        type: "response.output_text.delta",
+        delta: "Hello keepalive-safe",
+      })}\n\n`,
+      `data: ${JSON.stringify({
+        type: "response.completed",
+        response: {
+          id: "resp_keepalive",
+          object: "response",
+          model: "gpt-4.1-mini",
+          status: "completed",
+          usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+        },
+      })}\n\n`,
+      "data: [DONE]\n\n",
+    ],
+    {
+      mode: "passthrough",
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "openai",
+      model: "gpt-4.1-mini",
+      body: { input: "hello" },
+    }
+  );
+
+  assert.equal(text.includes("event: keepalive"), false);
+  assert.equal(text.includes("data:\n\n"), false);
+  assert.match(text, /response\.output_text\.delta/);
+  assert.match(text, /Hello keepalive-safe/);
+  assert.match(text, /data: \[DONE\]/);
 });
